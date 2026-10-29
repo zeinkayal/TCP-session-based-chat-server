@@ -1,3 +1,6 @@
 /out/
 /.idea/
 /src/allcode.txt
+/src/main/java/allcode.txt
+/src/test/java/testcode.txt
+/target/

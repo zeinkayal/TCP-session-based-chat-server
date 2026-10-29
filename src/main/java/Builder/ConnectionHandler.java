@@ -1,5 +1,6 @@
 package Builder;
 
+import GlobalHolders.GlobalExecutor;
 import GlobalHolders.GlobalSystemReader;
 import Runnables.ConsoleWriter;
 import Runnables.SocketReader;
@@ -10,7 +11,8 @@ import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.net.Socket;
 import java.util.Arrays;
-import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 
 public class ConnectionHandler {
     private final PrintWriter printWriter ;
@@ -61,16 +63,16 @@ public class ConnectionHandler {
         System.out.println(Arrays.toString(msg));
         return true;
     }
-
     public void echoHeartBeat(){printWriter.println("PONG");}
     public void construct() throws IOException , InterruptedException {
         ConsoleWriter writer=new ConsoleWriter(GlobalSystemReader.reader,printWriter);
-        Thread writerThread= new Thread(writer);
-        writerThread.setDaemon(true);
+        GlobalExecutor.executor.submit(writer);
         SocketReader socketReader=new SocketReader(bufferedReader,this);
-        Thread readerThread=new Thread(socketReader);
-        readerThread.start();
-        writerThread.start();
-        readerThread.join();
+        Future<?> readerTask=GlobalExecutor.executor.submit(socketReader);
+        try {
+            readerTask.get();
+        } catch (ExecutionException e) {
+            throw new RuntimeException(e);
+        }
     }
 }

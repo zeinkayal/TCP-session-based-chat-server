@@ -44,12 +44,21 @@ public class ClientConnection {
     public void setIsAlive(){
         isAlive.set(true);
     }
+    public void setClientName(String name){
+        clientName=name;
+    }
     public void setClientName() throws IOException {
         String name=this.read();
         clientName=(name==null)?null:name.trim();
     }
     public String getClientName(){
         return this.clientName;
+    }
+    public ScheduledFuture<?> getHeartBeatMonitor(){
+        return this.pingTask;
+    }
+    public Boolean getIsAlive(){
+        return isAlive.get();
     }
 
 }
