@@ -1,333 +1,312 @@
-# TCP Session-Based Chat Server
+# TCP Session Chat Server
 
-A Java TCP server that implements ephemeral, password-protected chat sessions directly on the Java socket APIs. The project focuses less on chat features as a product and more on the server-side engineering concerns underneath them: socket lifecycle management, session ownership, concurrent client handling, liveness detection, and the tradeoffs of a blocking, thread-per-connection architecture.
+A Java server that hosts ephemeral, password-protected chat rooms over raw TCP sockets, with no networking framework. Sessions live only in memory and disappear when the last participant leaves. The project is centered on the server-side problems underneath a chat application: connection lifecycle, shared state across many connection-handling threads, liveness detection, and deterministic cleanup.
 
-This repository is interesting from a systems perspective because it makes the application protocol, connection state, and thread coordination explicit instead of hiding them behind a framework. The code demonstrates how a simple TCP server manages multiple clients, tracks session membership, cleans up resources, and monitors client health without relying on external libraries or higher-level server frameworks.
+Stack: Java 25, Maven, `java.net` sockets, virtual threads, `java.util.concurrent`, JUnit 5, Awaitility.
+
+---
+
+## What this project demonstrates
+
+- A hand-built application protocol over line-oriented TCP
+- Per-connection concurrency on virtual threads
+- Shared mutable state with explicit synchronization choices
+- Failure detection at the application layer
+- Session lifecycle management and room cleanup
+- Integration tests over real loopback sockets
+
+No benchmarks have been run, so this README does not claim performance numbers or scalability guarantees.
+
+---
 
 ## Architecture
 
-The system is structured around a small number of responsibilities:
-
-Client
-→ TCP Socket
-→ ServerSocket
-→ ClientConnection
-→ Router
-→ SessionManager / Session
-→ other ClientConnections
-
-The actual flow is straightforward:
-
-- `TcpServer` accepts incoming TCP connections and starts a new thread for each client.
-- Each accepted socket is wrapped in a `ClientConnection`, which encapsulates the socket, input/output streams, and connection state.
-- `Router` drives the application-level protocol for each connected client. It reads commands such as `CREATE` and `JOIN`, validates them, and decides whether the client should be attached to a session.
-- `SessionManager` creates and joins sessions, while `Session` owns the participant list for a room.
-- `ClientConnection` provides the boundary between network I/O and session logic.
-- When a client is active in a session, messages are forwarded to other participants in that same session.
-- A separate heartbeat mechanism runs on a scheduled executor to monitor whether a peer is still alive.
-
-This separation of responsibilities is deliberate. Networking concerns remain near the socket boundary, session rules are isolated in the manager/session layer, and message broadcasting is handled by the router rather than being embedded in the socket or client logic.
-
-## Networking Model
-
-The application currently uses:
-
-- TCP as the transport protocol
-- blocking Java sockets
-- line-oriented communication via `BufferedReader` and `PrintWriter`
-- one server-side thread per active client connection
-
-This is a simple and explicit networking model. The server accepts a client, wraps it in a `ClientConnection`, and then reads from that socket in a dedicated thread. Because each connection is handled by its own thread, a blocking read on one client does not necessarily prevent the server from servicing other clients.
-
-That design is easy to reason about and aligns well with the educational and systems-oriented goals of the project. It also makes the architecture’s limitation visible: each active connection is associated with a thread, so the server’s resource footprint grows with the number of clients. This creates a clear motivation for a future NIO-based or non-blocking design.
-
-This repository does not implement NIO, selectors, asynchronous channels, or an event loop. The implementation is intentionally blocking and thread-based.
-
-## Features
-
-The repository demonstrates the following server behaviors:
-
-- Create an ephemeral chat session with a password
-- Join an existing session using the correct password
-- Broadcast messages to other participants in the same session
-- Track active sessions in memory
-- Remove participants when a connection terminates
-- Remove the session from the global registry when the last participant leaves
-- Detect a dead or unresponsive peer with a heartbeat mechanism
-- Keep networking, routing, and session logic separated across classes
-
-The chat behavior is the application-level demonstration; the underlying engineering value is in the server design.
-
-## Application Protocol
-
-The project uses a lightweight, line-oriented application protocol built directly on top of the socket streams. Messages are exchanged in plain text, one line at a time.
-
-### Session creation
-
-`CREATE,<session>,<password>`
-
-### Session join
-
-`JOIN,<session>,<password>`
-
-### Heartbeat
-
-`PING`
-`PONG`
-
-### Session exit
-
-`./Exit`
-
-These commands are intentionally simple. There is no formal protocol versioning, no binary framing, and no encryption layer. The protocol is a minimal application-level convention between the client and server.
-
-## Session Lifecycle
-
-The session model is simple but useful to examine from an engineering perspective.
-
-1. A client connects to the TCP server.
-2. The client identifies itself by sending a name.
-3. The client sends either `CREATE` or `JOIN` with a session identifier and password.
-4. `Router` delegates the request to `SessionManager`.
-5. `SessionManager` either creates a new session or validates access to an existing one.
-6. Once the session is active, messages are broadcast to the other participants.
-7. When the client disconnects or sends `./Exit`, it is removed from the session.
-8. If the session becomes empty, it is removed from the global session registry.
-
-This lifecycle is meaningful because it demonstrates real server concerns: session ownership, participant tracking, cleanup, and state transitions over time. The project is not just “chat rooms”; it is an in-memory session manager built on top of sockets.
-
-## Concurrency and Connection Management
-
-The concurrency model is one of the strongest parts of the repository and worth emphasizing.
-
-### Global session registry
-
-The server stores sessions in a `ConcurrentHashMap`:
-
-- `GlobalMapHolder.SHARED_MAP`
-
-This ensures the map can be accessed by multiple connection-handling threads without requiring a single-threaded bottleneck. Session lookup by name is expected to be average-case `O(1)`.
-
-### Session participants
-
-Each `Session` owns a `CopyOnWriteArrayList<ClientConnection>` for its participants.
-
-This structure supports concurrent iteration while updates occur. The repository frequently iterates through the participant list to broadcast messages, while participant modifications are comparatively less frequent. That makes `CopyOnWriteArrayList` a reasonable fit for this access pattern, even if it is not necessarily the optimal choice for all higher-throughput workloads.
-
-### Thread model
-
-The server creates a dedicated thread for each accepted socket:
-
-- `TcpServer` accepts a client
-- a new `Thread` is created
-- `GlobalRouter.SHARED_ROUTER.start(connection)` runs on that thread
-
-This architecture is simple and explicit, and it allows each client to have independent blocking reads and writes without central serialization. The cost is that each active connection consumes a thread, which is a natural limitation of the current design.
-
-### Synchronization
-
-Synchronization is used in specific areas where shared state requires coordination:
-
-- `Session.addParticipant` is synchronized
-- `Session.remove` is synchronized
-- `ClientConnection.send` is synchronized
-- some methods coordinate access to the socket and connection data
-
-This is not a claim that the entire system is globally thread-safe in every scenario. The code demonstrates targeted synchronization for state transitions and socket writes, but the architectural simplicity of the design remains clear: the system is a multi-threaded server with shared state that is intentionally constrained and managed.
-
-## Heartbeat and Liveness Detection
-
-The repository includes a heartbeat implementation in `ScheduledHeartBeatChecker`.
-
-### Actual mechanism
-
-A scheduled task runs every 5 seconds:
-
-- if the connection is still alive, it sends `PING`
-- if the connection has not responded, it closes the socket
-
-The liveness state is tracked by an `AtomicBoolean` in `ClientConnection`:
-
-- when a `PONG` arrives, `setIsAlive()` is called
-- when a ping is sent, `consumeIsAlive()` is called
-- if the connection does not respond, the heartbeat task removes the monitor and closes the socket
-
-This is a simple application-level liveness check. It does not try to pretend it is a full distributed health system or a sophisticated protocol. The point is practical: TCP does not always provide immediate application-level certainty that a peer has disappeared in all failure modes, so the server performs an explicit check.
-
-This is a useful systems engineering pattern because it makes connection failure behavior visible and allows cleanup to occur before stale sockets remain in a session.
-
-## Session and Message Flow
-
-A typical connection lifecycle is:
-
-1. Client connects.
-2. Client sends a display name.
-3. Client sends `CREATE,<session>,<password>` or `JOIN,<session>,<password>`.
-4. `Router` validates the request.
-5. If accepted, the session is created or the client joins.
-6. The client sends messages.
-7. Messages are broadcast to all other participants.
-8. Client sends `./Exit` or disconnects.
-9. Participant is removed.
-10. If no participants remain, the session is removed from `GlobalMapHolder.SHARED_MAP`.
-
-This is the real engineering value of the project: it is a small but concrete example of application-layer session orchestration built over raw sockets.
-
-## Example Interaction
-
-A simple example of the system’s intended behavior:
-
-Client A
-- connects
-- sends `CREATE,engineering,secret123`
-- receives `OK, Session successfully created`
-
-Client B
-- connects
-- sends `JOIN,engineering,secret123`
-- receives `OK, Successfully joined session`
-
-Client A sends:
-- `hello from A`
-
-Client B receives:
-- `A : hello from A`
-
-This demonstrates the core application behavior: sessions are room-like abstractions, and messages are routed to members of the same session instead of broadcast to all clients globally.
-
-## Design Decisions and Tradeoffs
-
-### Blocking sockets
-
-The implementation favors blocking Java sockets because they keep the code explicit and easy to follow. A client’s read operation blocks until data arrives, but because each client is assigned its own thread, the server can serve multiple clients concurrently without a more complex event-driven scheduler.
-
-This is easy to teach and easy to reason about, but it also introduces a clear scaling issue: one active connection requires one thread.
-
-### Thread-per-connection model
-
-The thread-per-client design is simple and effective for a small number of simultaneous clients. It also makes the lifetime of a connection and the ownership of socket resources very visible. The tradeoff is that it does not scale as gracefully as a non-blocking or event-driven architecture.
-
-### `ConcurrentHashMap`
-
-The session registry is shared across multiple client threads, so `ConcurrentHashMap` is the appropriate choice for the global session index. It prevents the application from relying on a single-threaded session registry.
-
-### `CopyOnWriteArrayList`
-
-Participants are stored in a `CopyOnWriteArrayList`, which is compatible with frequent iteration during message broadcasts and relatively infrequent mutation. This matches the repository’s access pattern more closely than a simple array list would, and it permits safe iteration without explicit locking in many cases.
-
-### Heartbeat mechanism
-
-The project does not depend solely on TCP to signal client death. Instead, it introduces a heartbeat mechanism that sends `PING` and expects `PONG`. This is a practical application-layer liveness check designed to catch stale or broken connections that may otherwise remain in the session state.
-
-## Project Structure
-
 ```text
-TCP-session-based-chat-server
-├── .gitignore
-└── src
-    ├── Builder
-    │   └── ConnectionHandler.java
-    ├── Client
-    │   └── TcpClient.java
-    ├── Clients
-    │   └── ClientConnection.java
-    ├── Connection
-    │   └── ScheduledHeartBeatChecker.java
-    ├── GlobalHolders
-    │   ├── GlobalMapHolder.java
-    │   ├── GlobalRouter.java
-    │   └── GlobalSystemReader.java
-    ├── Manager
-    │   ├── Session.java
-    │   └── SessionManager.java
-    ├── Router
-    │   └── Router.java
-    ├── Runnables
-    │   ├── ConsoleWriter.java
-    │   └── SocketReader.java
-    ├── Server
-    │   └── TcpServer.java
-    └── ...
-```
+TcpServer.accept()
+   └─ virtual thread per connection ──► Router.start(connection)
+        ├─ InitializeSession      name → CREATE/JOIN loop → SessionManager
+        ├─ startHeartBeatMonitor  (only after a successful join)
+        └─ streamAndCleanUp       broadcast loop
+              finally: cancel heartbeat, leave session, close socket
 
-The structure separates responsibilities clearly:
+Component responsibilities
 
-- `Server` starts the listener
-- `Clients` wraps individual socket connections
-- `Router` handles session logic
-- `Manager` owns session state
-- `GlobalHolders` contains shared runtime state
-- `Connection` contains liveness monitoring
-- `Builder` and `Runnables` are client-side or terminal-oriented helpers
+    Server.TcpServer
+        opens a ServerSocket
+        accepts incoming TCP connections
+        wraps each socket in a ClientConnection
+        submits work to GlobalExecutor.executor
 
-## Running the Project
+    GlobalHolders.GlobalExecutor
+        manages the process-wide virtual-thread executor
+        Executors.newVirtualThreadPerTaskExecutor()
 
-The repository currently does not include Maven, Gradle, or a project build file. The project is compiled directly with `javac`.
+    Clients.ClientConnection
+        owns the socket, reader, writer, display name, liveness flag, and heartbeat task
+        serializes outbound writes with synchronized send(...)
 
-### Compile
+    Router.Router
+        drives the protocol flow
+        runs the create/join handshake
+        broadcasts messages to the session
+        performs cleanup in a finally block
 
-```bash
-javac -d out $(find src -name "*.java")
-```
+    Manager.SessionManager
+        creates and joins sessions
+        validates passwords
+        returns OK or ERROR responses
 
-### Start the server
+    Manager.Session
+        owns the participant list
+        manages membership add/remove logic
+        removes itself from the global registry when empty
 
-```bash
-java -cp out Server.TcpServer
-```
+    Connection.ScheduledHeartBeatChecker
+        runs a scheduled task per connection
+        sends PING to detect stale clients
+        closes the socket when the previous PONG was not received
 
-### Start a client
+    GlobalHolders.*
+        contains process-wide state such as the session registry and shared router
 
-```bash
-java -cp out Client.TcpClient
-```
+    Client, Builder, and Runnables
+        client-side terminal logic, handshake prompts, and read/write loops
 
-The default server port is `8080`, and the default host is `localhost`.
+The handshake and streaming phases are deliberately separated (InitializeSession and streamAndCleanUp). That separation is what makes the lifecycle and cleanup logic testable without needing to simulate a full terminal UI.
+Protocol
 
-## Limitations
+All messages are single lines of UTF-8 text.
+Handshake
+Text
 
-This project is intentionally small and demonstrates a clear server architecture, but there are meaningful architectural constraints:
+client → server   <display name>
+client → server   CREATE,<session>,<password>
+client → server   JOIN,<session>,<password>
+server → client   OK, <message>
+server → client   ERROR, <message>
 
-- blocking I/O, with one thread per active client
-- in-memory session state only
-- no persistence between process restarts
-- no TLS or transport-layer encryption
-- minimal input validation
-- a simple, text-based application protocol without formal message schema
-- no automated test suite
-- no build automation or packaging configuration
+After an ERROR, the client may retry on the same connection. The server keeps looping in the handshake until a create or join succeeds or the client disconnects.
+Streaming
+Text
 
-These are not criticisms of the implementation; they are the design boundaries of a first version.
+client → server   any other text
+server → client   PING
+client → server   PONG
+client → server   ./Exit
 
-## Next Version: Java NIO / Non-Blocking Networking
+Behavior:
 
-This repository represents a first implementation built around direct socket programming and a thread-per-client model. A natural next step would be a v2 that explores Java NIO:
+    a normal chat message is delivered to every other participant as <name> : <text>
+    PING is sent by the server to detect stale peers
+    PONG resets the liveness flag
+    ./Exit ends the session loop and triggers cleanup
 
-- `ServerSocketChannel`
-- `SocketChannel`
-- `Selector`
-- non-blocking I/O
-- explicit connection state tracking
-- event-driven message handling
-- reduced coupling to one thread per client
+Wire-level example:
+Text
 
-That next version would address the architectural cost of blocking sockets while preserving the same basic session semantics and server responsibilities.
+A → server   alice
+A → server   CREATE,engineering,secret123
+server → A   OK, Session successfully created
 
-## License
+B → server   bob
+B → server   JOIN,engineering,wrongpw
+server → B   ERROR, Wrong password! Please enter the password again
 
-No explicit license file is present in the repository at the time of inspection, so no license declaration has been established for this project.
+B → server   JOIN,engineering,secret123
+server → B   OK, Successfully joined session
 
-## Engineering Summary
+A → server   hello
+server → B   alice : hello
 
-This project is best understood as a Java TCP server implementing ephemeral, password-protected chat sessions using direct socket APIs and explicit concurrency primitives. The engineering interest is not in the chat feature itself, but in the architecture beneath it:
+server → A   PING
+A → server   PONG
 
-- connection lifecycle management
-- blocking I/O
-- thread-per-client concurrency
-- room/session state
-- shared mutable state across threads
-- liveness detection
-- cleanup and resource management
-- separation of responsibilities across networking, routing, and session layers
+PONG and ./Exit are treated as control traffic. A message consisting of exactly those strings is not forwarded as normal chat content.
+Concurrency model
+Session registry
 
-That is the technical story this repository tells.
+The server stores sessions in a ConcurrentHashMap:
+
+    GlobalMapHolder.SHARED_MAP
+
+This allows multiple connection-handling threads to create, join, and remove sessions without depending on a single global lock.
+Session membership
+
+Each session keeps its participants in a CopyOnWriteArrayList<ClientConnection>.
+
+This is a good fit for the server’s usage pattern:
+
+    the broadcast loop iterates the participant list frequently
+    membership changes are less frequent
+    the list is updated by join/leave operations
+
+Synchronization
+
+Synchronization is used in targeted places:
+
+    Session.addParticipant(...) is synchronized
+    Session.remove(...) is synchronized
+    ClientConnection.send(...) is synchronized
+
+This is not a claim that the entire server is magically perfect or universally lock-free; it is a practical way to serialize state transitions and outbound writes that could otherwise interleave.
+Thread model
+
+Each accepted connection is serviced by its own virtual thread. This keeps the model straightforward:
+
+    the server can accept many connections without a one-thread-per-connection pattern in the old blocking sense
+    each client maintains its own read loop
+    individual connections remain independent
+
+The tradeoff remains visible: the server still has a relationship between active clients and execution resources, even though the underlying threading model is virtual-thread-based rather than classic thread-per-task.
+Connection lifecycle and failure handling
+
+Every exit path converges on the finally block in streamAndCleanUp, which:
+
+    cancels the heartbeat task
+    removes the participant from the session
+    removes the session if it is empty
+    closes the socket
+
+Lifecycle events
+
+    client sends ./Exit
+        broadcast loop ends
+        cleanup runs
+
+    client disconnects or the read fails
+        readLine() returns null or throws
+        cleanup runs
+
+    peer goes silent
+        the next heartbeat tick sees that the liveness flag was not reset
+        the socket is closed
+        the same cleanup path runs
+
+    last participant leaves
+        session is removed from the registry
+        the session name can be reused
+
+The heartbeat starts only after a successful join, so PING never overlaps with the handshake itself. A silent peer is evicted after the next missed liveness check; with the current 5-second heartbeat interval, that means roughly 5–10 seconds after the last valid PONG.
+Testing
+
+The project includes automated tests under src/test/java using JUnit 5 and Awaitility. The tests validate real socket behavior rather than only isolated unit logic.
+Current coverage
+
+    connection lifecycle behavior
+    session cleanup when a client closes
+    multi-client interaction and message broadcasting
+
+Relevant classes:
+
+    Tests.TestForConnectionLifeCycleAndSessionCleanUp
+    Tests.TestingMultipleClientInteraction
+
+These tests start a server on a loopback socket and assert asynchronous outcomes using Awaitility instead of fixed sleeps.
+
+Not yet covered:
+
+    handshake error paths
+    duplicate session names
+    wrong password handling
+    malformed input
+    concurrent create/join/leave race cases on a single session name
+    silent-peer eviction under the heartbeat
+
+The heartbeat test waits in real time because the timer is fixed at 5 seconds.
+Build and run
+
+The project uses Maven.
+Build and test
+bash
+
+./mvnw clean test
+
+Compile only
+bash
+
+./mvnw clean compile
+
+Run the server
+bash
+
+./mvnw exec:java -Dexec.mainClass=Server.TcpServer
+
+If the exec plugin is not configured in your local setup, you can run the compiled classes directly:
+bash
+
+./mvnw clean compile
+java -cp target/classes Server.TcpServer
+
+Run a client
+bash
+
+java -cp target/classes Client.TcpClient
+
+The default server port is 8080 and the default host is localhost.
+
+At the client prompt, enter a display name and then type:
+Text
+
+Create <session> <password>
+
+or
+Text
+
+Join <session> <password>
+
+Type ./Exit to leave the room.
+Known limitations
+
+    No transport security; traffic and passwords are sent in plaintext
+    No persistence; sessions exist only in memory
+    Minimal validation of malformed input
+    Informal application protocol with comma-delimited fields
+    No formal protocol versioning
+    No rate limiting on repeated join attempts
+    No external observability or logging system
+    No build pipeline or CI configuration yet
+    Session state is process-local and not distributed
+
+These are not flaws in the sense of “broken”; they are the practical boundaries of the repository as it currently exists.
+Roadmap
+
+The repository is clearly moving toward a more structured systems project:
+
+    richer server commands such as MEMBERS, KICK, and FLUSH
+    explicit admin/owner authority within a session
+    TLS/SSL for encrypted client-server communication
+    a Java NIO version using Selector and non-blocking I/O
+    stronger validation and malformed-input handling
+    improved configuration and cleaner build/test automation
+
+This is a natural next-phase evolution for the existing architecture.
+Project structure
+Text
+
+src
+├── Server           TcpServer
+├── Clients          ClientConnection
+├── Router           Router
+├── Manager          Session, SessionManager
+├── Connection       ScheduledHeartBeatChecker
+├── GlobalHolders    GlobalMapHolder, GlobalRouter, GlobalExecutor, GlobalSystemReader
+├── Client           TcpClient
+├── Builder          ConnectionHandler
+├── Runnables        ConsoleWriter, SocketReader
+├── Tests            JUnit/Awaitility integration tests
+├── TestDataFactory  mock server/client helpers
+└── main/java        all production source files
+
+License
+
+No explicit license file is present in the repository at the time of inspection, so no license declaration has been established for the project.
+Engineering summary
+
+This repository is best described as a Java TCP session server built directly on socket primitives, with explicit handling of:
+
+    connection lifecycle
+    room/session state
+    thread-per-client concurrency
+    state cleanup
+    liveness checks
+    separation of responsibilities across networking, routing, and session logic
